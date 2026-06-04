@@ -76,26 +76,33 @@ class TestField:
         response = await field.handle_set(request)
         assert response.header.return_code == ReturnCode.E_UNKNOWN_METHOD
 
-    async def test_notifier_on_set(self):
-        field = Field(service_id=0x1234, field_id=0x0100, notifier_id=0x0100)
-        notified_values = []
+    async def test_notifier_builds_notification(self):
+        """Test that notify() builds a valid NOTIFICATION message."""
+        field = Field(service_id=0x1234, field_id=0x0100)
 
-        field.add_notifier_handler(lambda v: notified_values.append(v))
+        async def get_value():
+            return b"\xFF"
 
-        async def set_value(value: bytes) -> bytes:
-            return value
+        field.set_getter_handler(get_value)
 
-        field.set_setter_handler(set_value)
+        msg = await field.notify()
+        assert msg is not None
+        assert msg.header.service_id == 0x1234
+        assert msg.header.method_id == 0x8100  # field_id | 0x8000
+        assert msg.payload == b"\xFF"
 
-        request = SomeipMessage.build_request(
-            service_id=0x1234, method_id=0x0101,
-            client_id=0x0001, session_id=0x0001,
-            interface_version=0x01, payload=b"\xFF",
-        )
+    async def test_notifier_uses_custom_id(self):
+        """Test that notify() uses the custom notifier_id if provided."""
+        field = Field(service_id=0x1234, field_id=0x0100, notifier_id=0x9001)
 
-        await field.handle_set(request)
-        assert len(notified_values) == 1
-        assert notified_values[0] == b"\xFF"
+        async def get_value():
+            return b"\x42"
+
+        field.set_getter_handler(get_value)
+
+        msg = await field.notify()
+        assert msg is not None
+        assert msg.header.method_id == 0x9001
 
     async def test_field_ids(self):
         field = Field(

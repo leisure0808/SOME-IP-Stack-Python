@@ -115,8 +115,12 @@ class TestTpReassembler:
         for seg in segments:
             result = reassembler.add_segment(seg)
 
-        # The reassembler returns the full payload bytes
-        assert result == payload
+        # The reassembler returns a SomeipMessage
+        assert isinstance(result, SomeipMessage)
+        assert result.payload == payload
+        assert result.header.service_id == 0x1234
+        assert result.header.method_id == 0x0001
+        assert result.header.message_type == MessageType.REQUEST
 
     def test_reassemble_in_order(self):
         payload = b"A" * 1000
@@ -132,7 +136,8 @@ class TestTpReassembler:
         for i, seg in enumerate(segments):
             result = reassembler.add_segment(seg)
             if i == len(segments) - 1:
-                assert result == payload
+                assert isinstance(result, SomeipMessage)
+                assert result.payload == payload
             else:
                 assert result is None
 

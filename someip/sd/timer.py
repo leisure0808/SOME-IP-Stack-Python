@@ -27,20 +27,23 @@ class SdPhase(Enum):
 
 @dataclass
 class SdTimingConfig:
-    """SD timing configuration (all values in seconds)."""
+    """SD timing configuration (all values in seconds).
 
-    # Initial phase
-    initial_delay_min: float = 0.0
-    initial_delay_max: float = 0.5
+    Default values per AUTOSAR SOME/IP Service Discovery Protocol specification.
+    """
 
-    # Repeat phase
-    repetitions_base_delay: float = 0.01  # 10ms
-    repetitions_max: int = 3  # Number of repetitions in REPEAT phase
+    # Initial phase: random delay before first offer/find
+    initial_delay_min: float = 0.1   # 100ms per spec
+    initial_delay_max: float = 1.0   # 1000ms per spec
 
-    # Main phase
-    cyclic_offer_delay: float = 2.0  # 2 seconds
+    # Repeat phase: rapid repetitions
+    repetitions_base_delay: float = 0.03  # 30ms per spec
+    repetitions_max: int = 5              # 5 repetitions per spec
 
-    # Request response
+    # Main phase: regular heartbeat
+    cyclic_offer_delay: float = 1.0  # 1 second per spec
+
+    # Request response delay
     request_response_delay: float = 1.5  # 1.5 seconds
 
 
@@ -95,25 +98,32 @@ class SdTimer:
 
     def force_main_phase(self) -> None:
         """Skip directly to MAIN phase (e.g., after receiving a FindService)."""
-        if self._phase in (SdPhase.INITIAL, SdPhase.REPEAT):
+        if self._phase in (SdPhase.INITIAL, SdPhase.REPEAT, SdPhase.MAIN):
+            if self._phase == SdPhase.MAIN:
+                return
             self._phase = SdPhase.MAIN
             self._repeat_count = 0
-            # Cancel current task to break out of current sleep
+            # Cancel current task so it breaks out of sleep
             if self._task and not self._task.done():
                 self._task.cancel()
+                # Create a new task that will enter _main_phase directly
+                self._task = asyncio.create_task(self._run(), name=self._name)
 
     async def _run(self) -> None:
         """Main timer loop."""
         try:
-            await self._initial_phase()
-            if self._phase == SdPhase.STOPPED:
-                return
+            if self._phase == SdPhase.INITIAL:
+                await self._initial_phase()
+                if self._phase == SdPhase.STOPPED:
+                    return
 
-            await self._repeat_phase()
-            if self._phase == SdPhase.STOPPED:
-                return
+            if self._phase == SdPhase.REPEAT:
+                await self._repeat_phase()
+                if self._phase == SdPhase.STOPPED:
+                    return
 
-            await self._main_phase()
+            if self._phase == SdPhase.MAIN:
+                await self._main_phase()
         except asyncio.CancelledError:
             pass
 

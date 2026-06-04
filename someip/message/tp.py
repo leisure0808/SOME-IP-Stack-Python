@@ -6,6 +6,8 @@ segments, each with its own SOME/IP header with the TP flag set.
 TP header extension (4 additional bytes after standard header):
     Offset  Size  Field
     0       4     Offset (bits 0-27) + More Segments flag (bit 31, MSB)
+
+Per AUTOSAR spec, the TP flag is bit 5 (0x20) of the Message Type field.
 """
 
 import struct
@@ -87,12 +89,13 @@ class TpSegmenter:
         """
         payload = message.payload
 
-        if len(payload) <= self.mtu - TP_HEADER_EXT_SIZE:
+        # Maximum payload per segment (minus TP extension)
+        segment_payload_size = self.mtu - TP_HEADER_EXT_SIZE
+
+        if len(payload) <= segment_payload_size:
             # No segmentation needed
             return [message]
 
-        # Maximum payload per segment (minus TP extension)
-        segment_payload_size = self.mtu - TP_HEADER_EXT_SIZE
         segments: List[SomeipMessage] = []
         offset = 0
 
@@ -103,14 +106,15 @@ class TpSegmenter:
             # Build TP extension
             tp_ext = build_tp_extension(offset, more_segments=not is_last)
 
-            # Build segment header (with TP flag)
+            # Build segment header (with TP flag set via with_tp())
             segment_msg_type = message.header.message_type.with_tp()
-            segment_length = 8 + TP_HEADER_EXT_SIZE + len(chunk) + len(tp_ext)
+            # length = 8 (request_id + version + type + retcode) + TP ext + chunk
+            segment_length = 8 + TP_HEADER_EXT_SIZE + len(chunk)
 
             segment_header = SomeipHeader(
                 service_id=message.header.service_id,
                 method_id=message.header.method_id,
-                length=8 + TP_HEADER_EXT_SIZE + len(chunk),
+                length=segment_length,
                 client_id=message.header.client_id,
                 session_id=message.header.session_id,
                 protocol_version=message.header.protocol_version,
@@ -143,14 +147,14 @@ class TpReassembler:
         """
         self._timeout = timeout
         # Key: (service_id, method_id, client_id, session_id)
-        # Value: dict with 'segments', 'total_size', 'start_time'
+        # Value: dict with 'segments', 'header', 'start_time'
         self._pending: Dict[tuple, dict] = {}
 
     def add_segment(self, message: SomeipMessage) -> Optional[SomeipMessage]:
         """Add a TP segment. Returns the complete message if all segments received.
 
         Returns None if more segments are needed.
-        Raises TpReassemblyError on timeout or duplicate.
+        Raises TpReassemblyError on timeout or gap.
         """
         key = (
             message.header.service_id,
@@ -166,10 +170,14 @@ class TpReassembler:
         now = time.monotonic()
 
         if key not in self._pending:
-            # First segment for this message
+            # First segment for this message - store header info from non-TP type
+            base_msg_type = message.header.message_type.without_tp()
             self._pending[key] = {
                 "segments": [],
+                "header": message.header,
+                "base_msg_type": base_msg_type,
                 "start_time": now,
+                "received_offsets": set(),
             }
 
         entry = self._pending[key]
@@ -181,7 +189,16 @@ class TpReassembler:
                 f"TP reassembly timeout for message {key}"
             )
 
+        # Check for duplicate segment
+        if tp_offset in entry["received_offsets"]:
+            logger.warning("Duplicate TP segment at offset %d for %s, ignoring", tp_offset, key)
+            return None
+
         entry["segments"].append((tp_offset, segment_payload))
+        entry["received_offsets"].add(tp_offset)
+
+        # Update header from last segment (most recent)
+        entry["header"] = message.header
 
         if not more_segments:
             # All segments received, reassemble
@@ -190,7 +207,7 @@ class TpReassembler:
         return None
 
     def _reassemble(self, key: tuple, entry: dict) -> SomeipMessage:
-        """Reassemble segments into a complete message."""
+        """Reassemble segments into a complete SomeipMessage."""
         segments = sorted(entry["segments"], key=lambda s: s[0])
         del self._pending[key]
 
@@ -207,13 +224,27 @@ class TpReassembler:
 
         full_payload = b"".join(payload_parts)
 
-        # Build the reassembled message with non-TP header
-        last_segment = segments[-1]
-        # Use the header from the message context (service_id, method_id, etc.)
-        # We need to reconstruct with non-TP message type
-        # For now, construct from the key and last known header info
-        # The caller should have the original header info
-        return full_payload
+        # Reconstruct the complete message with non-TP message type
+        original_header = entry["header"]
+        base_msg_type = entry["base_msg_type"]
+        full_length = 8 + len(full_payload)
+
+        reassembled_header = SomeipHeader(
+            service_id=original_header.service_id,
+            method_id=original_header.method_id,
+            length=full_length,
+            client_id=original_header.client_id,
+            session_id=original_header.session_id,
+            protocol_version=original_header.protocol_version,
+            interface_version=original_header.interface_version,
+            message_type=base_msg_type,
+            return_code=original_header.return_code,
+        )
+
+        return SomeipMessage(
+            header=reassembled_header,
+            payload=full_payload,
+        )
 
     def reset(self, key: Optional[tuple] = None) -> None:
         """Reset reassembly state.

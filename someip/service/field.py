@@ -1,4 +1,15 @@
-"""SOME/IP field (getter/setter/notifier) management."""
+"""SOME/IP field (getter/setter/notifier) management.
+
+Per AUTOSAR SOME/IP spec:
+- Getter (method_id = field_id): Read the field value via Request/Response
+- Setter (method_id = field_id + 1): Write the field value via Request/Response
+- Notifier (event_id = field_id | 0x8000): Notification on value change
+
+The Notifier is sent as a NOTIFICATION message to all subscribers of
+the eventgroup that contains this field's notifier event. The application
+layer is responsible for sending the notification via the transport after
+calling notify().
+"""
 
 import asyncio
 import logging
@@ -15,9 +26,9 @@ class Field:
     """Manages a SOME/IP field.
 
     A field has up to three aspects:
-    - Getter (method_id = field_id + 0x0000): Read the field value
-    - Setter (method_id = field_id + 0x0001): Write the field value
-    - Notifier (event_id = field_id): Receive notifications on change
+    - Getter (method_id = field_id): Read the field value
+    - Setter (method_id = field_id + 1): Write the field value
+    - Notifier (event_id = field_id | 0x8000): Receive notifications on change
 
     Method IDs for field getter/setter use the same base ID as the field
     with an offset of +1 for the setter.
@@ -35,12 +46,12 @@ class Field:
         self._field_id = field_id
         self._getter_id = getter_id if getter_id is not None else field_id
         self._setter_id = setter_id if setter_id is not None else field_id + 1
-        self._notifier_id = notifier_id
+        # Notifier uses event ID with bit 15 set per AUTOSAR spec
+        self._notifier_id = notifier_id if notifier_id is not None else (field_id | 0x8000)
 
         self._value: bytes = b""
         self._getter_handler: Optional[Callable] = None
         self._setter_handler: Optional[Callable] = None
-        self._notifier_handlers: list = []
 
     @property
     def field_id(self) -> int:
@@ -55,7 +66,7 @@ class Field:
         return self._setter_id
 
     @property
-    def notifier_id(self) -> Optional[int]:
+    def notifier_id(self) -> int:
         return self._notifier_id
 
     @property
@@ -77,10 +88,6 @@ class Field:
     def set_setter_handler(self, handler: Callable) -> None:
         """Set the setter handler. Signature: async handler(value: bytes) -> bytes"""
         self._setter_handler = handler
-
-    def add_notifier_handler(self, handler: Callable) -> None:
-        """Add a notifier handler. Signature: handler(value: bytes)"""
-        self._notifier_handlers.append(handler)
 
     async def handle_get(self, request: SomeipMessage) -> SomeipMessage:
         """Handle a getter request."""
@@ -107,15 +114,14 @@ class Field:
         )
 
     async def handle_set(self, request: SomeipMessage) -> SomeipMessage:
-        """Handle a setter request."""
+        """Handle a setter request.
+
+        Note: After a successful setter, the application layer should call
+        notify() and send the notification to all eventgroup subscribers.
+        """
         if self._setter_handler:
             try:
                 result = await self._setter_handler(request.payload)
-                # Notify on change if notifier exists
-                if self._notifier_id and self._notifier_handlers:
-                    for handler in self._notifier_handlers:
-                        handler(result)
-
                 return SomeipMessage.build_response(
                     request=request,
                     interface_version=0x01,
@@ -136,7 +142,11 @@ class Field:
         )
 
     async def notify(self, client_id: int = 0, session_id: int = 0) -> Optional[SomeipMessage]:
-        """Build a notification message for this field."""
+        """Build a notification message for this field.
+
+        The caller should send this message to all eventgroup subscribers
+        via the transport layer.
+        """
         if self._notifier_id and self._getter_handler:
             value = await self._getter_handler()
             return SomeipMessage.build_notification(

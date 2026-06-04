@@ -30,6 +30,7 @@ class SdMessage:
     flags: SdFlags = field(default_factory=SdFlags)
     entries: List[SdEntry] = field(default_factory=list)
     options: List[SdOption] = field(default_factory=list)
+    session_id: int = 0x0000  # SD session ID
 
     def serialize(self) -> bytes:
         """Serialize to a complete SOME/IP message."""
@@ -58,7 +59,7 @@ class SdMessage:
             method_id=SD_METHOD_ID,
             length=length,
             client_id=0x0000,
-            session_id=0x0000,  # TODO: session handling
+            session_id=self.session_id & 0xFFFF,
             protocol_version=0x01,
             interface_version=0x01,
             message_type=MessageType.NOTIFICATION,

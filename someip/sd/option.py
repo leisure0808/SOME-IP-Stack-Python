@@ -79,6 +79,9 @@ class SdOption:
         if opt_type in (SdOptionType.IPv4_ENDPOINT, SdOptionType.IPv4_SD_ENDPOINT,
                         SdOptionType.IPv4_MULTICAST):
             return _deserialize_ipv4_option(opt_type, option_data, total_size)
+        elif opt_type in (SdOptionType.IPv6_ENDPOINT, SdOptionType.IPv6_SD_ENDPOINT,
+                          SdOptionType.IPv6_MULTICAST):
+            return _deserialize_ipv6_option(opt_type, option_data, total_size)
         elif opt_type == SdOptionType.CONFIGURATION:
             return _deserialize_config_option(opt_type, option_data, total_size)
         else:
@@ -193,4 +196,65 @@ def _deserialize_config_option(
                 configuration[k] = v
 
     option = ConfigOption(option_type=opt_type, configuration=configuration)
+    return option, total_size
+
+
+def _ipv6_to_bytes(address: str) -> bytes:
+    """Convert IPv6 address string to 16 bytes."""
+    import ipaddress
+    addr = ipaddress.IPv6Address(address)
+    return addr.packed
+
+
+def _bytes_to_ipv6(data: bytes) -> str:
+    """Convert 16 bytes to IPv6 address string."""
+    import ipaddress
+    addr = ipaddress.IPv6Address(data[:16])
+    return str(addr)
+
+
+@dataclass
+class IPv6EndpointOption:
+    """IPv6 endpoint option (type 0x06, 0x16, 0x26).
+
+    After common header (type + reserved):
+        [uint8 reserved] [uint8 L4 Proto] [uint16 port] [16 bytes IPv6 addr]
+    Total data after length field: 1+1+1+2+16 = 21 bytes
+    Length field value = 21
+    Total with header = 23, padded to 24
+    """
+
+    option_type: SdOptionType = SdOptionType.IPv6_ENDPOINT
+    address: str = "::1"
+    port: int = 0
+    protocol: int = 17  # 6=TCP, 17=UDP
+
+    def serialize(self) -> bytes:
+        addr_bytes = _ipv6_to_bytes(self.address)
+        data = struct.pack(">BBH", 0, self.protocol, self.port) + addr_bytes
+        length = 2 + len(data)  # type + reserved + payload
+        header = struct.pack(">HBB", length, int(self.option_type), 0)
+        raw = header + data
+        # Pad to 4-byte boundary
+        pad = (4 - (len(raw) % 4)) % 4
+        return raw + b"\x00" * pad
+
+
+def _deserialize_ipv6_option(
+    opt_type: SdOptionType, data: bytes, total_size: int
+) -> Tuple[IPv6EndpointOption, int]:
+    """Deserialize IPv6 endpoint/multicast option."""
+    # data after type(1) + reserved(1): reserved(1) + proto(1) + port(2) + addr(16)
+    if len(data) < 19:
+        raise MessageFormatError("IPv6 option data too short")
+
+    _, protocol, port = struct.unpack_from(">BBH", data, 0)
+    address = _bytes_to_ipv6(data[4:20])
+
+    option = IPv6EndpointOption(
+        option_type=opt_type,
+        address=address,
+        port=port,
+        protocol=protocol,
+    )
     return option, total_size

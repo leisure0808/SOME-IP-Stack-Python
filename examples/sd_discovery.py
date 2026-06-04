@@ -4,20 +4,17 @@ Demonstrates how services discover each other via the SD protocol:
 - Server: offers a service via SD multicast
 - Client: finds the service and receives the offer
 
-This example uses UDP multicast on 224.224.224.245:30490 (standard SD address).
+Uses separate transports for SD and service messages:
+- SD transport: handles OfferService, FindService on the SD port (30490)
+- Service transport: handles actual service method calls
 
 Run in two terminals:
   Terminal 1: python -m examples.sd_discovery server
   Terminal 2: python -m examples.sd_discovery client
-
-Note: On Windows, multicast may require admin privileges or specific
-network configuration. If multicast doesn't work, this example falls
-back to unicast on localhost.
 """
 
 import asyncio
 import logging
-import struct
 import sys
 
 from someip.config.service_config import ServiceInterfaceConfig
@@ -25,9 +22,6 @@ from someip.config.stack_config import StackConfiguration
 from someip.message.message import SomeipMessage
 from someip.message.return_code import ReturnCode
 from someip.sd.agent import SdAgent, ServiceOffer
-from someip.sd.entry import SdEntry, SdEntryType
-from someip.sd.message import SdMessage
-from someip.sd.option import IPv4EndpointOption, SdOptionType
 from someip.service.skeleton import Skeleton
 from someip.service.proxy import Proxy
 from someip.service.dispatcher import Dispatcher
@@ -46,6 +40,8 @@ METHOD_PING = 0x0001
 SERVER_PORT = 30504
 SD_PORT = 30490
 
+SD_MULTICAST = "224.224.224.245"
+
 
 async def run_server():
     """Start a server that offers its service via SD."""
@@ -63,92 +59,63 @@ async def run_server():
 
     skeleton.register_method(METHOD_PING, ping_handler)
 
-    # Transport
+    # Service transport for SOME/IP messages (method calls)
     transport = UdpTransport(local_port=SERVER_PORT)
+
+    # SD transport on the SD port for SD messages
+    sd_transport = UdpTransport(local_port=SD_PORT)
 
     # Dispatcher
     dispatcher = Dispatcher()
     dispatcher.register_skeleton(skeleton)
 
-    # SD Agent
+    # Stack configuration
     stack_config = StackConfiguration(
-        sd_multicast_address="224.224.224.245",
-        sd_port=SD_PORT,
         unicast_address="127.0.0.1",
+        sd_multicast_address=SD_MULTICAST,
+        sd_port=SD_PORT,
     )
-    sd_agent = SdAgent(transport, stack_config)
 
-    # Wire up message flow
-    async def on_message(message: SomeipMessage, source: tuple):
+    # SdAgent with separate SD transport
+    sd_agent = SdAgent(transport, stack_config, sd_transport=sd_transport)
+
+    # Service message routing
+    async def on_service_message(message: SomeipMessage, source: tuple):
         if message.header.is_sd:
-            # Let SD agent handle SD messages
             sd_agent._on_message_received(message, source)
         else:
             response = await dispatcher.dispatch(message, source)
             if response is not None:
                 await transport.send(response, source)
 
-    transport.set_message_handler(on_message)
-    await transport.start()
+    transport.set_message_handler(on_service_message)
 
-    # Also start a separate UDP listener on SD port for SD messages
-    sd_transport = UdpTransport(local_port=SD_PORT)
-    sd_transport.set_message_handler(on_message)
+    # Start both transports
+    await transport.start()
     await sd_transport.start()
 
-    logger.info("Server started on port %d, SD port %d", SERVER_PORT, SD_PORT)
+    # Register SD handler + join multicast group on SD transport
+    await sd_agent.start_sd_listener()
 
-    # Manually broadcast an OfferService message
+    # Offer the service via SdAgent (handles periodic OfferService + FindService responses)
     offer = ServiceOffer(
         service_id=SERVICE_ID,
         instance_id=INSTANCE_ID,
         major_version=1,
         minor_version=0,
-        address="127.0.0.1",
-        port=SERVER_PORT,
-        protocol=17,
-    )
-
-    # Build and send OfferService manually
-    entry = SdEntry(
-        entry_type=SdEntryType.OFFER_SERVICE,
-        service_id=SERVICE_ID,
-        instance_id=INSTANCE_ID,
-        major_version=1,
         ttl=0xFFFFFF,
-        minor_version=0,
-    )
-    option = IPv4EndpointOption(
-        option_type=SdOptionType.IPv4_ENDPOINT,
         address="127.0.0.1",
         port=SERVER_PORT,
         protocol=17,
     )
-    sd_msg = SdMessage(entries=[entry], options=[option])
-    offer_data = sd_msg.serialize()
-    offer_msg = SomeipMessage.deserialize(offer_data)
+    await sd_agent.offer_service(offer)
 
-    # Send offer periodically
+    logger.info("Server started on port %d, SD port %d", SERVER_PORT, SD_PORT)
     logger.info("Offering service 0x%04X on 127.0.0.1:%d", SERVICE_ID, SERVER_PORT)
 
     try:
         while True:
-            # Send offer to SD multicast
-            try:
-                await sd_transport.send(
-                    offer_msg,
-                    ("224.224.224.245", SD_PORT),
-                )
-            except Exception:
-                # Multicast may fail on some systems, also send unicast
-                pass
-
-            # Also send as unicast for local testing
-            await transport.send(offer_msg, ("127.0.0.1", SD_PORT + 1))
-
-            logger.info("OfferService sent")
-            await asyncio.sleep(2.0)
-
+            await asyncio.sleep(3600.0)  # Run forever
     except asyncio.CancelledError:
         pass
     finally:
@@ -169,9 +136,11 @@ async def run_client():
     proxy = Proxy(config)
     proxy.client_id = 0x0004
 
-    # We need a transport on SD_PORT + 1 for unicast SD
-    client_sd_port = SD_PORT + 1
-    transport = UdpTransport(local_port=client_sd_port)
+    # Service transport for SOME/IP messages (method calls)
+    transport = UdpTransport(local_port=0)
+
+    # SD transport for SD messages
+    sd_transport = UdpTransport(local_port=0)
 
     # Dispatcher
     dispatcher = Dispatcher()
@@ -186,49 +155,37 @@ async def run_client():
         )
         discovered_services.append(offer)
 
-    # SD Agent
+    # Stack configuration
     stack_config = StackConfiguration(
-        sd_multicast_address="224.224.224.245",
-        sd_port=SD_PORT,
         unicast_address="127.0.0.1",
+        sd_multicast_address=SD_MULTICAST,
+        sd_port=SD_PORT,
     )
-    sd_agent = SdAgent(transport, stack_config)
+    sd_agent = SdAgent(transport, stack_config, sd_transport=sd_transport)
     sd_agent.set_service_available_handler(on_service_available)
 
-    # Wire up message flow
-    async def on_message(message: SomeipMessage, source: tuple):
+    # Service message routing
+    async def on_service_message(message: SomeipMessage, source: tuple):
         if message.header.is_sd:
             sd_agent._on_message_received(message, source)
         else:
             await dispatcher.dispatch(message, source)
 
-    transport.set_message_handler(on_message)
-    await transport.start()
+    transport.set_message_handler(on_service_message)
 
-    # Also listen on SD port for multicast
-    sd_transport = UdpTransport(local_port=0)
-    sd_transport.set_message_handler(on_message)
+    # Start both transports
+    await transport.start()
     await sd_transport.start()
+
+    # Register SD handler + join multicast group on SD transport
+    await sd_agent.start_sd_listener()
 
     logger.info("Client started, looking for service 0x%04X...", SERVICE_ID)
 
-    # Send FindService manually
-    find_entry = SdEntry(
-        entry_type=SdEntryType.FIND_SERVICE,
-        service_id=SERVICE_ID,
-        instance_id=0xFFFF,
-        major_version=0xFF,
-        ttl=0xFFFFFF,
-    )
-    find_msg = SdMessage(entries=[find_entry])
-    find_data = find_msg.serialize()
-    find_someip_msg = SomeipMessage.deserialize(find_data)
+    # Send FindService via SdAgent
+    await sd_agent.find_service(SERVICE_ID)
 
     try:
-        # Send find request
-        await sd_transport.send(find_someip_msg, ("127.0.0.1", SD_PORT))
-        logger.info("FindService sent")
-
         # Wait for service discovery
         for i in range(10):
             await asyncio.sleep(1.0)

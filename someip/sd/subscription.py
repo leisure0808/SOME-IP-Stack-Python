@@ -1,7 +1,8 @@
 """SOME/IP Service Discovery subscription state tracking."""
 
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -16,6 +17,8 @@ class SubscriptionState:
     remote_port: int = 0
     is_subscribed: bool = False
     reference_count: int = 0
+    ttl: int = 0xFFFFFF
+    subscribed_at: float = 0.0  # monotonic timestamp
 
 
 @dataclass
@@ -31,6 +34,7 @@ class OfferedService:
     port: int = 0
     protocol: int = 17  # UDP
     eventgroups: Set[int] = field(default_factory=set)
+    received_at: float = 0.0  # monotonic timestamp when last offer received
 
 
 class SubscriptionManager:
@@ -55,6 +59,7 @@ class SubscriptionManager:
                 offer.major_version = entry.major_version
                 offer.minor_version = entry.minor_version
                 offer.ttl = entry.ttl
+                offer.received_at = time.monotonic()
             else:
                 self._offered_services[key] = OfferedService(
                     service_id=entry.service_id,
@@ -62,6 +67,7 @@ class SubscriptionManager:
                     major_version=entry.major_version,
                     minor_version=entry.minor_version,
                     ttl=entry.ttl,
+                    received_at=time.monotonic(),
                 )
 
     def update_offer_endpoint(self, service_id: int, instance_id: int,
@@ -95,13 +101,16 @@ class SubscriptionManager:
 
     def add_subscription(self, service_id: int, instance_id: int,
                          eventgroup_id: int, major_version: int,
-                         remote_address: str = "", remote_port: int = 0) -> None:
+                         remote_address: str = "", remote_port: int = 0,
+                         ttl: int = 0xFFFFFF) -> None:
         """Add or update an eventgroup subscription."""
         key = (service_id, instance_id, eventgroup_id)
         sub = self._subscriptions.get(key)
         if sub:
             sub.reference_count += 1
             sub.is_subscribed = True
+            sub.ttl = ttl
+            sub.subscribed_at = time.monotonic()
         else:
             self._subscriptions[key] = SubscriptionState(
                 service_id=service_id,
@@ -112,6 +121,8 @@ class SubscriptionManager:
                 remote_port=remote_port,
                 is_subscribed=True,
                 reference_count=1,
+                ttl=ttl,
+                subscribed_at=time.monotonic(),
             )
 
     def remove_subscription(self, service_id: int, instance_id: int,
@@ -135,3 +146,35 @@ class SubscriptionManager:
             sub for key, sub in self._subscriptions.items()
             if key[0] == service_id and key[1] == instance_id
         ]
+
+    def check_expired_offers(self) -> List[Tuple[int, int]]:
+        """Check for expired service offers (TTL elapsed without refresh).
+
+        Returns list of (service_id, instance_id) tuples for expired offers.
+        """
+        now = time.monotonic()
+        expired = []
+        for key, offer in list(self._offered_services.items()):
+            # TTL of 0xFFFFFF means "infinite" — never expires
+            if offer.ttl >= 0xFFFFFF:
+                continue
+            if now - offer.received_at > offer.ttl:
+                expired.append(key)
+                del self._offered_services[key]
+        return expired
+
+    def check_expired_subscriptions(self) -> List[Tuple[int, int, int]]:
+        """Check for expired subscriptions (TTL elapsed without refresh).
+
+        Returns list of (service_id, instance_id, eventgroup_id) tuples for expired subs.
+        """
+        now = time.monotonic()
+        expired = []
+        for key, sub in list(self._subscriptions.items()):
+            # TTL of 0xFFFFFF means "infinite" — never expires
+            if sub.ttl >= 0xFFFFFF:
+                continue
+            if now - sub.subscribed_at > sub.ttl:
+                expired.append(key)
+                del self._subscriptions[key]
+        return expired

@@ -43,8 +43,10 @@ class Proxy(ServiceInterface):
         self._client_id = value
 
     def _next_session_id(self) -> int:
-        """Get next session ID (wraps around at 0xFFFF)."""
-        self._session_id = (self._session_id + 1) & 0xFFFF
+        """Get next session ID (wraps from 0xFFFF to 0x0001, skipping 0)."""
+        self._session_id += 1
+        if self._session_id > 0xFFFF:
+            self._session_id = 0x0001
         return self._session_id
 
     def build_request(

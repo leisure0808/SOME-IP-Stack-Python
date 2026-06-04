@@ -1,4 +1,4 @@
-"""SOME/IP container types: Struct, Array, DynamicArray, Enum, Map, Union."""
+"""SOME/IP container types: Struct, Array, DynamicArray, Enum, Map, Union, TaggedMember."""
 
 import struct
 from dataclasses import dataclass, field
@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.protocol import ProtocolVersion
 from ..error import SerializationError
-from .primitives import TypeDescriptor, UInt32Type, UInt8Type
+from .primitives import TypeDescriptor, UInt32Type, UInt8Type, UInt16Type
 
 
 def _padding_bytes(current_offset: int, alignment: int) -> int:
@@ -361,3 +361,224 @@ class UnionType(TypeDescriptor):
         if self.protocol_version.supports_union_length_prefix:
             return 4
         return self.discriminator_type.alignment
+
+
+class WireType:
+    """SOME/IP TLV Wire Type codes for tagged struct members.
+
+    Per AUTOSAR SOME/IP v1.8.0 specification:
+    - Wire types 0-3: base data types (8/16/32/64 bit)
+    - Wire types 4-7: complex types with length field
+    """
+
+    BASE_8BIT = 0
+    BASE_16BIT = 1
+    BASE_32BIT = 2
+    BASE_64BIT = 3
+    COMPLEX_STATIC_LEN = 4   # Complex type with configured static length field size
+    COMPLEX_8BIT_LEN = 5     # Complex type with 1-byte length field
+    COMPLEX_16BIT_LEN = 6    # Complex type with 2-byte length field
+    COMPLEX_32BIT_LEN = 7    # Complex type with 4-byte length field
+
+
+@dataclass
+class TaggedMember:
+    """A tagged/optional struct member per AUTOSAR SOME/IP v1.8.0.
+
+    Tagged members use a Tag-Length-Value (TLV) encoding:
+    - Tag (2 bytes): wire_type (3 bits) + data_id (12 bits)
+    - Length (variable): depends on wire_type
+    - Value: the actual data
+
+    Used for version-tolerant serialization where new fields can be added
+    without breaking backward compatibility.
+    """
+
+    data_id: int           # 12-bit identifier, unique within a struct
+    member_type: TypeDescriptor
+    wire_type: int = 0     # Auto-detected if 0
+    is_optional: bool = True
+
+    def __post_init__(self):
+        if self.data_id < 0 or self.data_id > 0xFFF:
+            raise SerializationError(f"data_id must be 0-4095, got {self.data_id}")
+        if self.wire_type == 0:
+            self.wire_type = self._infer_wire_type()
+
+    def _infer_wire_type(self) -> int:
+        """Infer wire type from member_type alignment/size."""
+        align = self.member_type.alignment
+        if align <= 1:
+            return WireType.BASE_8BIT
+        elif align == 2:
+            return WireType.BASE_16BIT
+        elif align == 4:
+            return WireType.BASE_32BIT
+        elif align == 8:
+            return WireType.BASE_64BIT
+        else:
+            return WireType.COMPLEX_32BIT_LEN
+
+    def _encode_tag(self) -> bytes:
+        """Encode the 2-byte Tag: [wire_type 3 bits][data_id 12 bits][reserved 1 bit]."""
+        # Tag layout per AUTOSAR: byte0[6:4]=wire_type, byte0[3:0]+byte1[7]=data_id
+        # Simplified: bits 15-13 = wire_type, bits 12-1 = data_id, bit 0 = reserved
+        tag = ((self.wire_type & 0x07) << 13) | ((self.data_id & 0xFFF) << 1)
+        return struct.pack(">H", tag)
+
+    @staticmethod
+    def _decode_tag(data: bytes, offset: int) -> Tuple[int, int, int]:
+        """Decode a 2-byte Tag. Returns (wire_type, data_id, bytes_consumed)."""
+        tag = struct.unpack_from(">H", data, offset)[0]
+        wire_type = (tag >> 13) & 0x07
+        data_id = (tag >> 1) & 0xFFF
+        return wire_type, data_id, 2
+
+    def encode_with_tag(self, value: Any) -> bytes:
+        """Encode the tagged member: Tag + [Length] + Value."""
+        tag_bytes = self._encode_tag()
+        value_bytes = self.member_type.encode(value)
+
+        if self.wire_type >= WireType.COMPLEX_STATIC_LEN:
+            # Complex type: include length prefix
+            if self.wire_type == WireType.COMPLEX_8BIT_LEN:
+                length_bytes = struct.pack(">B", len(value_bytes))
+            elif self.wire_type == WireType.COMPLEX_16BIT_LEN:
+                length_bytes = struct.pack(">H", len(value_bytes))
+            else:  # COMPLEX_32BIT_LEN or COMPLEX_STATIC_LEN
+                length_bytes = struct.pack(">I", len(value_bytes))
+            return tag_bytes + length_bytes + value_bytes
+        else:
+            # Base type: no length prefix
+            return tag_bytes + value_bytes
+
+    @staticmethod
+    def decode_tagged(data: bytes, offset: int) -> Tuple[int, int, int]:
+        """Decode just the Tag and length info. Returns (wire_type, data_id, total_tag_and_length_bytes)."""
+        wire_type, data_id, tag_size = TaggedMember._decode_tag(data, offset)
+        length_size = 0
+        if wire_type >= WireType.COMPLEX_STATIC_LEN:
+            if wire_type == WireType.COMPLEX_8BIT_LEN:
+                length_size = 1
+            elif wire_type == WireType.COMPLEX_16BIT_LEN:
+                length_size = 2
+            else:
+                length_size = 4
+        return wire_type, data_id, tag_size + length_size
+
+
+class TaggedStructType(TypeDescriptor):
+    """SOME/IP struct with tagged/optional members per v1.8.0.
+
+    Supports a mix of regular (positional) fields and tagged fields.
+    Regular fields are encoded first sequentially, then tagged fields
+    are appended with Tag-Length-Value encoding.
+    """
+
+    def __init__(
+        self,
+        fields: List[Tuple[str, TypeDescriptor]],
+        tagged_fields: Optional[List[Tuple[str, TaggedMember]]] = None,
+    ):
+        self.fields = fields
+        self.tagged_fields = tagged_fields or []
+
+    def encode(self, value: Any) -> bytes:
+        if not isinstance(value, dict):
+            raise SerializationError(
+                f"TaggedStruct encode expected dict, got {type(value).__name__}"
+            )
+        result = bytearray()
+
+        # Encode regular (positional) fields
+        for field_name, field_type in self.fields:
+            if field_name not in value:
+                raise SerializationError(
+                    f"Missing field '{field_name}' in struct"
+                )
+            pad = _padding_bytes(len(result), field_type.alignment)
+            result.extend(b"\x00" * pad)
+            result.extend(field_type.encode(value[field_name]))
+
+        # Encode tagged fields (only if present in value dict)
+        for field_name, tagged_member in self.tagged_fields:
+            if field_name in value:
+                result.extend(tagged_member.encode_with_tag(value[field_name]))
+
+        return bytes(result)
+
+    def decode(self, data: bytes, offset: int = 0) -> Tuple[Any, int]:
+        result: Dict[str, Any] = {}
+        pos = offset
+
+        # Decode regular (positional) fields
+        for field_name, field_type in self.fields:
+            pad = _padding_bytes(pos, field_type.alignment)
+            pos += pad
+            value, consumed = field_type.decode(data, pos)
+            result[field_name] = value
+            pos += consumed
+
+        # Decode tagged fields
+        tagged_lookup = {tm.data_id: (fn, tm) for fn, tm in self.tagged_fields}
+        while pos < len(data):
+            # Try to read a tag
+            if pos + 2 > len(data):
+                break
+            wire_type, data_id, tag_and_length_size = TaggedMember.decode_tagged(data, pos)
+
+            if data_id not in tagged_lookup:
+                # Unknown tagged field - skip it
+                # Need to determine the total size to skip
+                skip = tag_and_length_size
+                if wire_type >= WireType.COMPLEX_STATIC_LEN:
+                    # Read the length to know how much data to skip
+                    length_offset = pos + 2  # after tag
+                    if wire_type == WireType.COMPLEX_8BIT_LEN and length_offset < len(data):
+                        data_len = data[length_offset]
+                        skip = 2 + 1 + data_len
+                    elif wire_type == WireType.COMPLEX_16BIT_LEN and length_offset + 1 < len(data):
+                        data_len = struct.unpack_from(">H", data, length_offset)[0]
+                        skip = 2 + 2 + data_len
+                    elif wire_type >= WireType.COMPLEX_32BIT_LEN and length_offset + 3 < len(data):
+                        data_len = struct.unpack_from(">I", data, length_offset)[0]
+                        skip = 2 + 4 + data_len
+                    else:
+                        break
+                else:
+                    # Base types: fixed size based on wire type
+                    base_sizes = {0: 1, 1: 2, 2: 4, 3: 8}
+                    skip = 2 + base_sizes.get(wire_type, 0)
+                pos += skip
+                continue
+
+            field_name, tagged_member = tagged_lookup[data_id]
+            # Skip past tag and optional length
+            pos += tag_and_length_size
+            # Decode the value
+            value, consumed = tagged_member.member_type.decode(data, pos)
+            result[field_name] = value
+            pos += consumed
+
+        return result, pos - offset
+
+    def byte_length(self, value: Any = None) -> int:
+        if value is None:
+            raise SerializationError("Cannot compute byte_length of TaggedStruct without value")
+        length = 0
+        for field_name, field_type in self.fields:
+            pad = _padding_bytes(length, field_type.alignment)
+            length += pad
+            length += field_type.byte_length(value[field_name])
+        for field_name, tagged_member in self.tagged_fields:
+            if field_name in value:
+                # Tag (2) + optional length + value
+                encoded = tagged_member.encode_with_tag(value[field_name])
+                length += len(encoded)
+        return length
+
+    @property
+    def alignment(self) -> int:
+        if not self.fields:
+            return 1
+        return max(ft.alignment for _, ft in self.fields)

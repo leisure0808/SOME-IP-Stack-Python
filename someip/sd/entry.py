@@ -9,9 +9,17 @@ SD entry layout (16 bytes):
     Byte 7:    Major Version (uint8)
     Byte 8-10: TTL (3 bytes, uint24)
     Byte 11-15: depends on entry type:
-        Service entry: Minor Version (uint32 + 1 reserved byte = 4 bytes)
-            Actually: 4 bytes = Minor Version (uint32)
-        EventGroup entry: Reserved (uint8) + EventGroup ID (uint16) + Reserved (uint8)
+        Service entry: Minor Version (uint32)
+        EventGroup entry:
+            Byte 11: [IDRF bit7][reserved bit6-4][counter bit3-0]
+            Byte 12-13: EventGroup ID (uint16)
+            Byte 14: reserved
+            Byte 15: reserved
+
+Per AUTOSAR spec:
+- OfferService and StopOfferService share type 0x01; TTL=0 means Stop.
+- SubscribeEventgroup and StopSubscribeEventgroup share type 0x06; TTL=0 means Stop.
+- SubscribeEventgroupACK and SubscribeEventgroupNACK share type 0x07; TTL=0 means NACK.
 """
 
 import struct
@@ -23,13 +31,16 @@ from ..error import MessageFormatError
 
 
 class SdEntryType(IntEnum):
-    """SD entry type field values."""
+    """SD entry type field values.
+
+    Per AUTOSAR spec, some types share the same value and are
+    distinguished by TTL: TTL > 0 = start/offer/ACK, TTL = 0 = stop/NACK.
+    """
 
     FIND_SERVICE = 0x00
-    OFFER_SERVICE = 0x01
-    SUBSCRIBE_EVENTGROUP = 0x06
-    SUBSCRIBE_EVENTGROUP_ACK = 0x07
-    SUBSCRIBE_EVENTGROUP_NACK = 0x08
+    OFFER_SERVICE = 0x01          # TTL=0 → StopOfferService
+    SUBSCRIBE_EVENTGROUP = 0x06   # TTL=0 → StopSubscribeEventgroup
+    SUBSCRIBE_EVENTGROUP_ACK = 0x07  # TTL=0 → SubscribeEventgroupNACK
 
 
 SD_ENTRY_SIZE = 16
@@ -48,6 +59,8 @@ class SdEntry:
     minor_version: int = 0
     # EventGroup entries
     eventgroup_id: int = 0
+    counter: int = 0               # 4 bits, distinguishes same subscriber requests
+    initial_data_requested: bool = False  # IDRF flag
     # Option indices and counts
     index_option_1: int = 0
     index_option_2: int = 0
@@ -66,12 +79,24 @@ class SdEntry:
         return self.entry_type in (
             SdEntryType.SUBSCRIBE_EVENTGROUP,
             SdEntryType.SUBSCRIBE_EVENTGROUP_ACK,
-            SdEntryType.SUBSCRIBE_EVENTGROUP_NACK,
         )
 
     @property
     def is_stop(self) -> bool:
+        """Check if this entry represents a Stop/NACK (TTL=0)."""
         return self.ttl == 0
+
+    @property
+    def is_nack(self) -> bool:
+        """Check if this is a SubscribeEventgroupNACK (type=0x07, TTL=0)."""
+        return (self.entry_type == SdEntryType.SUBSCRIBE_EVENTGROUP_ACK
+                and self.ttl == 0)
+
+    @property
+    def is_subscribe_ack(self) -> bool:
+        """Check if this is a SubscribeEventgroupACK (type=0x07, TTL>0)."""
+        return (self.entry_type == SdEntryType.SUBSCRIBE_EVENTGROUP_ACK
+                and self.ttl > 0)
 
     def serialize(self) -> bytes:
         """Serialize to 16-byte SD entry."""
@@ -89,20 +114,21 @@ class SdEntry:
         ttl_b3 = self.ttl & 0xFF
 
         if self.is_eventgroup_entry:
-            # Last 4 bytes: reserved(1) + eventgroup_id(2) + reserved(1)
+            # Byte 11: [IDRF bit7][reserved bit6-4][counter bit3-0]
+            idrf_and_counter = (0x80 if self.initial_data_requested else 0x00) | (self.counter & 0x0F)
             return struct.pack(
                 ">BBBBHHBBBB B H B",
                 type_byte,
                 opt_index,
                 opt_count,
-                0,  # reserved
+                0,  # reserved byte 3
                 self.service_id,
                 self.instance_id,
                 self.major_version,
                 ttl_b1, ttl_b2, ttl_b3,
-                0,  # reserved
+                idrf_and_counter,
                 self.eventgroup_id,
-                0,  # reserved
+                0,  # reserved last byte
             )
         else:
             # Last 4 bytes: minor_version (uint32)
@@ -163,12 +189,14 @@ class SdEntry:
 
         # Parse last 4 bytes based on type
         if entry.is_eventgroup_entry:
-            # reserved(1) + eventgroup_id(2) + reserved(1)
-            eventgroup_id = struct.unpack_from(">H", data, offset + 13)[0]
-            entry.eventgroup_id = eventgroup_id
+            # Byte 11: [IDRF bit7][reserved bit6-4][counter bit3-0]
+            idrf_and_counter = data[offset + 12]
+            entry.initial_data_requested = bool(idrf_and_counter & 0x80)
+            entry.counter = idrf_and_counter & 0x0F
+            # Byte 12-13: eventgroup_id
+            entry.eventgroup_id = struct.unpack_from(">H", data, offset + 13)[0]
         else:
             # minor_version (uint32)
-            minor_version = struct.unpack_from(">I", data, offset + 12)[0]
-            entry.minor_version = minor_version
+            entry.minor_version = struct.unpack_from(">I", data, offset + 12)[0]
 
         return entry, SD_ENTRY_SIZE
